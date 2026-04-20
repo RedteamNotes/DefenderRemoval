@@ -1,97 +1,93 @@
 <#
 .SYNOPSIS
-    RedTeamNotes: Native-Only Hardened Microsoft Defender Removal.
+    RedTeamNotes: Native Hardened Defender Removal (Ownership Focus).
 .DESCRIPTION
-    Native PowerShell script for deactivating Microsoft Defender. 
-    Uses ACL hijacking to modify protected registry keys.
+    Advanced registry manipulation by taking ownership from TrustedInstaller.
 #>
 
 [CmdletBinding()]
-param (
-    [Parameter()]
-    [Switch]$PurgeFiles
-)
+param ([Switch]$PurgeFiles)
 
 Write-Host "[*] RedTeamNotes Native Neutralization initialized." -ForegroundColor Cyan
 
-# --- Helper: Take Ownership and Grant FullControl ---
-function Grant-RegistryPermission {
+# --- Helper: Force Ownership and FullControl ---
+function Set-RegistryOwner {
     param([string]$Path)
-    # Registry keys are often owned by System/TrustedInstaller.
-    # We must hijack the ACL to grant 'Administrators' FullControl.
+    # Registry paths need to be converted to Windows API format for ownership
+    $CleanPath = $Path.Replace("HKLM:\", "HKEY_LOCAL_MACHINE\")
+    
+    # 1. Take Ownership using native SeTakeOwnershipPrivilege logic
+    # Administrators group SID: S-1-5-32-544
+    $AdminSid = New-Object System.Security.Principal.SecurityIdentifier("S-1-5-32-544")
     $Acl = Get-Acl -Path $Path
-    $Ar = New-Object System.Security.AccessControl.RegistryAccessRule(
-        "Administrators", "FullControl", "Allow"
-    )
-    $Acl.SetAccessRule($Ar)
+    $Acl.SetOwner($AdminSid)
+    
     try {
         Set-Acl -Path $Path -AclObject $Acl -ErrorAction Stop
+        
+        # 2. Grant Full Control
+        $Ar = New-Object System.Security.AccessControl.RegistryAccessRule(
+            "Administrators", "FullControl", "Allow"
+        )
+        $Acl.SetAccessRule($Ar)
+        Set-Acl -Path $Path -AclObject $Acl -ErrorAction Stop
+        return $true
     } catch {
-        Write-Warning "    [!] ACL update failed for $Path. Ensure Tamper Protection is OFF."
+        return $false
     }
 }
 
-# 1. Verification: Tamper Protection
+# 1. Pre-flight Check: Tamper Protection
 $TPPath = "HKLM:\SOFTWARE\Microsoft\Windows Defender\Features"
-$TPVal = Get-ItemProperty $TPPath -ErrorAction SilentlyContinue
-if ($TPVal.TamperProtection -ne 4) {
-    Write-Host "[!] CRITICAL: Tamper Protection is ENABLED. Manual disablement required in GUI." -ForegroundColor Yellow
+if ((Get-ItemProperty $TPPath).TamperProtection -ne 4) {
+    Write-Host "[!] CRITICAL: Tamper Protection is ENABLED. Manual GUI disablement REQUIRED." -ForegroundColor Yellow
+    Write-Host "    Path: Settings > Virus & threat protection > Manage settings > Tamper Protection"
 }
 
-# 2. Step 1/5: FileSystem Exclusion
+# 2. Step 1/5: Global Exclusion
 Write-Host "[Step 1/5] Injecting global filesystem exclusions..."
 67..90 | ForEach-Object {
     $Drive = [char]$_ + ":\"
-    if (Test-Path $Drive) {
-        Add-MpPreference -ExclusionPath $Drive -ErrorAction SilentlyContinue
-    }
+    if (Test-Path $Drive) { Add-MpPreference -ExclusionPath $Drive -ErrorAction SilentlyContinue }
 }
 
-# 3. Step 2/5: Disable Scheduled Tasks
-Write-Host "[Step 2/5] Neutralizing Defender Scheduled Tasks..."
+# 3. Step 2/5: Disable Tasks
+Write-Host "[Step 2/5] Neutralizing Scheduled Tasks..."
 Get-ScheduledTask -TaskPath "\Microsoft\Windows\Windows Defender\*" | Disable-ScheduledTask -ErrorAction SilentlyContinue
 
-# 4. Step 3/5: IFEO Hijacking (Process Execution Block)
-Write-Host "[Step 3/5] Applying IFEO redirection..."
+# 4. Step 3/5: IFEO Redirection (with Ownership)
+Write-Host "[Step 3/5] Applying IFEO redirection (Hijacking binaries)..."
+$IfeoRoot = "HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion\Image File Execution Options"
 $Binaries = @("MsMpEng.exe", "MpCmdRun.exe", "MpSigStub.exe")
+
 foreach ($Bin in $Binaries) {
-    # Using ${Bin} to prevent ParserError with colons
-    $Key = "HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion\Image File Execution Options\${Bin}"
-    if (-not (Test-Path $Key)) { New-Item $Key -Force | Out-Null }
-    Set-ItemProperty $Key -Name "Debugger" -Value "ntsd.exe -d"
+    $Key = "$IfeoRoot\${Bin}"
+    if (-not (Test-Path $Key)) { 
+        # Attempt to create key; if fails, try taking ownership of parent
+        try { New-Item $Key -Force | Out-Null } catch { Set-RegistryOwner -Path $IfeoRoot | Out-Null; New-Item $Key -Force | Out-Null }
+    }
+    Set-ItemProperty $Key -Name "Debugger" -Value "ntsd.exe -d" -ErrorAction SilentlyContinue
 }
 
-# 5. Step 4/5: Service Registry Surgery (ACL-based)
+# 5. Step 4/5: Service Neutralization (Aggressive ACL)
 Write-Host "[Step 4/5] Disabling Kernel Services and Drivers..."
 $Services = @("WinDefend", "WdNisSvc", "Sense", "SecurityHealthService", "WdBoot", "WdFilter", "WdNisDrv")
 
 foreach ($Svc in $Services) {
-    # Using ${Svc} to explicitly bound the variable name
     $RegPath = "HKLM:\SYSTEM\CurrentControlSet\Services\${Svc}"
     if (Test-Path $RegPath) {
-        Grant-RegistryPermission -Path $RegPath
-        try {
-            Set-ItemProperty -Path $RegPath -Name "Start" -Value 4 -ErrorAction Stop
+        if (Set-RegistryOwner -Path $RegPath) {
+            Set-ItemProperty -Path $RegPath -Name "Start" -Value 4 -ErrorAction SilentlyContinue
             Write-Host "    [-] ${Svc}: Disabled" -ForegroundColor Gray
-        } catch {
-            Write-Host "    [X] ${Svc}: Access Denied (Manual Tamper Protection OFF required)" -ForegroundColor Red
+        } else {
+            Write-Host "    [X] ${Svc}: Failed (Tamper Protection still blocking)" -ForegroundColor Red
         }
     }
 }
 
-# 6. Step 5/5: ELAM & Recovery Deactivation
-Write-Host "[Step 5/5] Finalizing Environment for Flare-VM..."
+# 6. Step 5/5: ELAM & BCD
+Write-Host "[Step 5/5] Finalizing Environment..."
 Set-ItemProperty "HKLM:\SYSTEM\CurrentControlSet\Control\EarlyLaunch" -Name "DisableAntiMalware" -Value 1 -ErrorAction SilentlyContinue
 bcdedit /set {current} recoveryenabled No | Out-Null
 
-if ($PurgeFiles) {
-    Write-Host "[!] Purging Defender physical structure..."
-    $Target = "C:\ProgramData\Microsoft\Windows Defender"
-    if (Test-Path $Target) {
-        takeown /f $Target /r /d y | Out-Null
-        icacls $Target /grant administrators:F /t | Out-Null
-        Remove-Item $Target -Recurse -Force -ErrorAction SilentlyContinue
-    }
-}
-
-Write-Host "[#] RedTeamNotes: Native removal complete. REBOOT REQUIRED." -ForegroundColor Green
+Write-Host "[#] RedTeamNotes: Operation complete. REBOOT REQUIRED." -ForegroundColor Green
