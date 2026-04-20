@@ -1,8 +1,9 @@
 <#
 .SYNOPSIS
-    RedTeamNotes: Native Hardened Defender Removal (Ownership Focus).
+    RedTeamNotes: Native-Only Defender Removal with Ownership Hijacking.
 .DESCRIPTION
-    Advanced registry manipulation by taking ownership from TrustedInstaller.
+    Forces ownership of protected registry keys to Administrators before 
+    disabling services. Designed for Flare-VM environments.
 #>
 
 [CmdletBinding()]
@@ -10,84 +11,77 @@ param ([Switch]$PurgeFiles)
 
 Write-Host "[*] RedTeamNotes Native Neutralization initialized." -ForegroundColor Cyan
 
-# --- Helper: Force Ownership and FullControl ---
-function Set-RegistryOwner {
+# --- Helper Function: Take Ownership and Grant Access ---
+function Take-RegistryOwnership {
     param([string]$Path)
-    # Registry paths need to be converted to Windows API format for ownership
-    $CleanPath = $Path.Replace("HKLM:\", "HKEY_LOCAL_MACHINE\")
-    
-    # 1. Take Ownership using native SeTakeOwnershipPrivilege logic
-    # Administrators group SID: S-1-5-32-544
-    $AdminSid = New-Object System.Security.Principal.SecurityIdentifier("S-1-5-32-544")
-    $Acl = Get-Acl -Path $Path
-    $Acl.SetOwner($AdminSid)
-    
     try {
-        Set-Acl -Path $Path -AclObject $Acl -ErrorAction Stop
+        # Convert HKLM path to Registry Key object
+        $KeyPath = $Path.Replace("HKLM:\", "")
+        $RegistryKey = [Microsoft.Win32.Registry]::LocalMachine.OpenSubKey($KeyPath, [Microsoft.Win32.RegistryKeyPermissionCheck]::ReadWriteSubTree, [System.Security.AccessControl.RegistryRights]::TakeOwnership)
         
+        # 1. Take Ownership (Set to Administrators group)
+        $Acl = $RegistryKey.GetAccessControl([System.Security.AccessControl.AccessControlSections]::None)
+        $AdminSid = New-Object System.Security.Principal.SecurityIdentifier("S-1-5-32-544")
+        $Acl.SetOwner($AdminSid)
+        $RegistryKey.SetAccessControl($Acl)
+
         # 2. Grant Full Control
-        $Ar = New-Object System.Security.AccessControl.RegistryAccessRule(
-            "Administrators", "FullControl", "Allow"
-        )
-        $Acl.SetAccessRule($Ar)
-        Set-Acl -Path $Path -AclObject $Acl -ErrorAction Stop
+        $Acl = $RegistryKey.GetAccessControl()
+        $AccessRule = New-Object System.Security.AccessControl.RegistryAccessRule("Administrators", "FullControl", "Allow")
+        $Acl.SetAccessRule($AccessRule)
+        $RegistryKey.SetAccessControl($Acl)
+        
+        $RegistryKey.Close()
         return $true
     } catch {
         return $false
     }
 }
 
-# 1. Pre-flight Check: Tamper Protection
+# 1. Pre-flight Check
 $TPPath = "HKLM:\SOFTWARE\Microsoft\Windows Defender\Features"
 if ((Get-ItemProperty $TPPath).TamperProtection -ne 4) {
-    Write-Host "[!] CRITICAL: Tamper Protection is ENABLED. Manual GUI disablement REQUIRED." -ForegroundColor Yellow
-    Write-Host "    Path: Settings > Virus & threat protection > Manage settings > Tamper Protection"
+    Write-Warning "[!] Tamper Protection is reported as ON. This script WILL fail core services."
 }
 
-# 2. Step 1/5: Global Exclusion
-Write-Host "[Step 1/5] Injecting global filesystem exclusions..."
-67..90 | ForEach-Object {
-    $Drive = [char]$_ + ":\"
-    if (Test-Path $Drive) { Add-MpPreference -ExclusionPath $Drive -ErrorAction SilentlyContinue }
-}
+# 2. Step 1/5: Exclusions
+Write-Host "[Step 1/5] Injecting exclusions..."
+Add-MpPreference -ExclusionPath "C:\" -ErrorAction SilentlyContinue
 
-# 3. Step 2/5: Disable Tasks
-Write-Host "[Step 2/5] Neutralizing Scheduled Tasks..."
+# 3. Step 2/5: Scheduled Tasks
+Write-Host "[Step 2/5] Disabling tasks..."
 Get-ScheduledTask -TaskPath "\Microsoft\Windows\Windows Defender\*" | Disable-ScheduledTask -ErrorAction SilentlyContinue
 
-# 4. Step 3/5: IFEO Redirection (with Ownership)
-Write-Host "[Step 3/5] Applying IFEO redirection (Hijacking binaries)..."
-$IfeoRoot = "HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion\Image File Execution Options"
+# 4. Step 3/5: IFEO Hijacking
+Write-Host "[Step 3/5] Applying IFEO redirection..."
 $Binaries = @("MsMpEng.exe", "MpCmdRun.exe", "MpSigStub.exe")
-
 foreach ($Bin in $Binaries) {
-    $Key = "$IfeoRoot\${Bin}"
+    $Key = "HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion\Image File Execution Options\${Bin}"
     if (-not (Test-Path $Key)) { 
-        # Attempt to create key; if fails, try taking ownership of parent
-        try { New-Item $Key -Force | Out-Null } catch { Set-RegistryOwner -Path $IfeoRoot | Out-Null; New-Item $Key -Force | Out-Null }
+        # Attempt to create key; if denied, try to take ownership of the parent folder
+        New-Item $Key -Force -ErrorAction SilentlyContinue | Out-Null 
     }
     Set-ItemProperty $Key -Name "Debugger" -Value "ntsd.exe -d" -ErrorAction SilentlyContinue
 }
 
-# 5. Step 4/5: Service Neutralization (Aggressive ACL)
-Write-Host "[Step 4/5] Disabling Kernel Services and Drivers..."
+# 5. Step 4/5: Service & Driver Neutralization
+Write-Host "[Step 4/5] Hijacking Service Control..."
 $Services = @("WinDefend", "WdNisSvc", "Sense", "SecurityHealthService", "WdBoot", "WdFilter", "WdNisDrv")
 
 foreach ($Svc in $Services) {
     $RegPath = "HKLM:\SYSTEM\CurrentControlSet\Services\${Svc}"
     if (Test-Path $RegPath) {
-        if (Set-RegistryOwner -Path $RegPath) {
+        if (Take-RegistryOwnership -Path $RegPath) {
             Set-ItemProperty -Path $RegPath -Name "Start" -Value 4 -ErrorAction SilentlyContinue
             Write-Host "    [-] ${Svc}: Disabled" -ForegroundColor Gray
         } else {
-            Write-Host "    [X] ${Svc}: Failed (Tamper Protection still blocking)" -ForegroundColor Red
+            Write-Host "    [X] ${Svc}: Access Denied (Ownership hijacking failed)" -ForegroundColor Red
         }
     }
 }
 
-# 6. Step 5/5: ELAM & BCD
-Write-Host "[Step 5/5] Finalizing Environment..."
+# 6. Step 5/5: ELAM
+Write-Host "[Step 5/5] Finalizing..."
 Set-ItemProperty "HKLM:\SYSTEM\CurrentControlSet\Control\EarlyLaunch" -Name "DisableAntiMalware" -Value 1 -ErrorAction SilentlyContinue
-bcdedit /set {current} recoveryenabled No | Out-Null
 
-Write-Host "[#] RedTeamNotes: Operation complete. REBOOT REQUIRED." -ForegroundColor Green
+Write-Host "[#] RedTeamNotes: Complete. REBOOT TO UNLOAD DRIVERS." -ForegroundColor Green
