@@ -4,7 +4,7 @@
     Comprehensive Windows Defender Deactivation Script.
     
 .DESCRIPTION
-    A multi-layered neutralization tool designed for isolated lab environments (e.g., Flare-VM).
+    A multi-layered neutralization tool designed for isolated lab environments (e.g., Flare VM).
     Integrates GPO policy enforcement, ACL/Ownership hijacking for Service Control Manager (SCM),
     Scheduled Task suspension, and Image File Execution Options (IFEO) hijacking.
     
@@ -43,8 +43,8 @@ function Set-RegistryAccess {
     } catch { return $false }
 }
 
-# --- Phase 1: GPO Policy Enforcement (Flare-VM Target) ---
-Write-Host "[1/7] Overriding GPO Policies for Flare-VM..."
+# --- Phase 1: GPO Policy Enforcement (Flare or Commando VM Target) ---
+Write-Host "[1/7] Overriding GPO Policies for Flare or Commando VM..."
 $GPOPaths = @(
     "HKLM:\SOFTWARE\Policies\Microsoft\Windows Defender",
     "HKLM:\SOFTWARE\Policies\Microsoft\Windows Defender\Real-Time Protection"
@@ -123,7 +123,7 @@ foreach ($R in $Results) {
 }
 
 if ($Ready) {
-    Write-Host "`n[#] SUCCESS: Environment is ready for Flare VM or Commando VM." -ForegroundColor Green
+    Write-Host "`n[#] SUCCESS: Environment is ready for Flare or Commando VM." -ForegroundColor Green
 } else {
     Write-Host "`n[#] WARNING: Reboot recommended to finalize neutralization." -ForegroundColor Yellow
 }
